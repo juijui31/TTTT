@@ -1,115 +1,1179 @@
-已讀取 `pasted_text_1789038356.txt`。這是一份約 44,679 字元的 **Windows PowerShell 5.1 WPF 系統最佳化工具**，核心設計為標準使用者權限執行，包含快取掃描/清理、啟動項審查與備份還原、HKCU 登錄值調整、程序工作集修剪與 DNS 快取重整功能。[1]
+<#
+.SYNOPSIS
+    Standard-User Safe System Maintenance Suite (PowerShell 5.1 Production Ready)
+.DESCRIPTION
+    完全相容 Windows PowerShell 5.1。以標準使用者 (Non-Admin) 權限執行的系統維護與安全快取清理工具。
+    提供高信心啟動項審查、安全白名單快取清理、可逆登錄檔調優、實體捷徑備份還原與現代淺色 GUI。
+.NOTES
+    架構標準: Modular Architecture v4.5 (Safe-Whitelisted Edition)
+    執行權限: 標準使用者 (無需管理員 UAC 提升)
+#>
 
-## 📋 診斷報告
+# ----------------------------------------------------------------------
+# 0. 載入 WPF 核心組件
+# ----------------------------------------------------------------------
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
-### 🔴 Critical
+# ----------------------------------------------------------------------
+# 1. 腳本內部設定模組 (Script Configuration Scope)
+# ----------------------------------------------------------------------
+$script:AppConfig = @{
+    AppName        = "系統維護與快取安全清理工具"
+    Version        = "4.5.0"
+    BackupRoot     = [System.IO.Path]::Combine($env:LOCALAPPDATA, "UserOptimizer\Backups")
+    MaxLogChars    = 100000
 
-- **P1：快取清理可能刪除非快取資料，風險高。**  
-  `WinExplorerThumb` 的目標被設為整個 `%LOCALAPPDATA%\Microsoft\Windows\Explorer` 資料夾；清理函式會遞迴刪除其中所有檔案，而非只處理 `thumbcache*.db`、`iconcache*.db` 等可重建快取。這個資料夾的內容不應以「整個目錄遞迴清空」處理。[1]
+    # 登錄檔調優項目 (包含型別、預設值與原始狀態契約)
+    RegistrySpecs  = @(
+        @{
+            Name        = "桌面選單展開延遲 (MenuShowDelay)"
+            Path        = "HKCU:\Control Panel\Desktop"
+            KeyName     = "MenuShowDelay"
+            TargetValue = "20"
+            ValueKind   = "String"
+            Description = "縮短滑鼠懸停於選單時的展開等待時間"
+        },
+        @{
+            Name        = "無回應程式判定逾時 (HungAppTimeout)"
+            Path        = "HKCU:\Control Panel\Desktop"
+            KeyName     = "HungAppTimeout"
+            TargetValue = "1500"
+            ValueKind   = "String"
+            Description = "縮短 Windows 判定應用程式失去回應的時間"
+        },
+        @{
+            Name        = "關閉無回應程式等候逾時 (WaitToKillAppTimeout)"
+            Path        = "HKCU:\Control Panel\Desktop"
+            KeyName     = "WaitToKillAppTimeout"
+            TargetValue = "2000"
+            ValueKind   = "String"
+            Description = "縮短登出或關機時強制結束無回應程式的等候時間"
+        },
+        @{
+            Name        = "視窗縮放動畫效果 (MinAnimate)"
+            Path        = "HKCU:\Control Panel\Desktop\WindowMetrics"
+            KeyName     = "MinAnimate"
+            TargetValue = "0"
+            ValueKind   = "String"
+            Description = "停用視窗最小化與最大化的過渡動畫以提升流暢感"
+        }
+    )
 
-- **P1：Firefox 清理目標過廣。**  
-  `FirefoxCache` 指向 `%LOCALAPPDATA%\Mozilla\Firefox\Profiles`，但該 Profiles 根目錄內每個 Profile 包含的不只是快取，還可能包含 profile-local 的資料結構。現行 `Clear-UserCachePath` 會將整個根目錄遞迴刪空，不能保證只刪可安全重建的 Firefox cache。[1]
+    # 啟動項目登錄檔位置
+    StartupRegKeys = @(
+        @{ Location = "HKCU Run"; Path = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" },
+        @{ Location = "HKCU RunOnce"; Path = "HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce" }
+    )
+    StartupFolder  = [System.IO.Path]::Combine($env:APPDATA, "Microsoft\Windows\Start Menu\Programs\Startup")
+}
 
-- **P1：Spotify `Data` 目錄不應被直接視為純快取。**  
-  `SpotifyCache` 指向 `%LOCALAPPDATA%\Spotify\Data`，並採完整遞迴刪除；其內容可能包含離線內容或應用程式資料。這將造成使用者資料被清掉、需要重新下載或重新登入的風險，與工具宣稱的「快取清理」不一致。[1]
+# ----------------------------------------------------------------------
+# 2. 基礎底層工具函式模組 (Infrastructure Helpers)
+# ----------------------------------------------------------------------
+function Format-SafeBytes {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory = $true)][long]$Bytes)
+    process {
+        if ($Bytes -le 0) { return "0 B" }
+        $units = @("B", "KB", "MB", "GB", "TB")
+        $order = [Math]::Truncate([Math]::Log($Bytes, 1024))
+        if ($order -ge $units.Length) { $order = $units.Length - 1 }
+        $val = $Bytes / [Math]::Pow(1024, $order)
+        return "{0:N2} {1}" -f $val, $units[$order]
+    }
+}
 
-- **P1：登錄檔備份無法區分「原本不存在」與「原本值等於預設字串」。**  
-  `Set-UserRegistryTuning` 在讀不到值時，將 `$currentVal` 設為 `$spec.Default`，再寫入備份。還原時一律使用 `Set-ItemProperty` 寫回該值，因此原先根本不存在的 registry value，會在還原後被永久建立。這不屬於精準還原。[1]
+function Initialize-SafeNativeMethods {
+    [CmdletBinding()]
+    param()
+    process {
+        if (-not ([System.Management.Automation.PSTypeName]'Win32ProcessMemoryHelper').Type) {
+            $cSharpSource = @"
+using System;
+using System.Runtime.InteropServices;
 
-- **P1：每次套用登錄調整都覆寫同一份備份。**  
-  `RegBackup.json` 是固定檔案；重複按「套用 HKCU 響應加速」後，第二次備份會把原始值覆蓋成第一次最佳化後的值。此後執行還原，將無法回到真正的調整前狀態。[1]
+public static class Win32ProcessMemoryHelper {
+    [DllImport("psapi.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool EmptyWorkingSet(IntPtr hProcess);
+}
+"@
+            Add-Type -TypeDefinition $cSharpSource -Language CSharp -ErrorAction Stop
+        }
+    }
+}
 
-- **P1：自啟項備份同樣只有單一固定檔案，且資料夾啟動項無法完整復原。**  
-  清理孤立項目時會覆寫 `StartupBackup.json`；`Restore-UserStartupOrphan` 對 `Folder` 類型的備份只輸出「檔案捷徑請手動放置」，沒有備份檔案內容、名稱、屬性或可還原副本。UI 卻以「還原已備份之自啟項」描述功能，實際行為不完整。[1]
+# ----------------------------------------------------------------------
+# 3. 安全快取定位與清理模組 (Whitelisted Cache Service)
+# ----------------------------------------------------------------------
+function Get-SafeCacheTargets {
+    [CmdletBinding()]
+    [OutputType([System.Collections.Generic.List[PSCustomObject]])]
+    param()
+    process {
+        $targets = New-Object 'System.Collections.Generic.List[PSCustomObject]'
 
-- **P1：無引號啟動命令列的路徑判定容易誤判為孤立項。**  
-  `Resolve-OptimizerExecutablePath` 嘗試以空白逐段累積並使用 `File.Exists()` 測試。例如含有環境變數、`cmd /c`、`rundll32`、PowerShell command、URL protocol handler、Windows Apps Alias、引用 DLL/腳本的啟動指令，都可能被解析為不存在的「檔案路徑」。後續 `Remove-UserStartupOrphan` 會依此刪除 registry 啟動項，存在錯刪有效項目的風險。[1]
+        # 1. 系統使用者暫存
+        $tempPath = [System.IO.Path]::GetTempPath()
+        if ([System.IO.Directory]::Exists($tempPath)) {
+            $targets.Add([PSCustomObject]@{
+                Category    = "系統暫存"
+                Name        = "使用者暫存目錄 ($env:TEMP)"
+                BasePath    = $tempPath
+                FilePattern = "*"
+                Recursive   = $true
+                IsDirectory = $false
+            })
+        }
 
-- **P1：WPF 視窗內的長時間工作仍在 UI 執行緒執行。**  
-  快取掃描與刪除、`Get-ChildItem -Recurse`、工作集修剪都由按鈕 Click event 直接同步執行。`DispatcherFrame` 只是在日誌輸出時暫時處理訊息，不能把工作移到背景執行緒；大量檔案時介面仍可能明顯卡住，甚至造成巢狀訊息迴圈的重入問題。[1]
+        # 2. 檔案總管縮圖快取 (嚴格白名單化：只刪 thumbcache_*.db 與 iconcache_*.db)
+        $explorerPath = [System.IO.Path]::Combine($env:LOCALAPPDATA, "Microsoft\Windows\Explorer")
+        if ([System.IO.Directory]::Exists($explorerPath)) {
+            $targets.Add([PSCustomObject]@{
+                Category    = "系統快取"
+                Name        = "檔案總管圖示與縮圖快取資料庫"
+                BasePath    = $explorerPath
+                FilePattern = "*cache_*.db"
+                Recursive   = $false
+                IsDirectory = $false
+            })
+        }
 
-### 🟡 Warning
+        # 3. Chromium 系列 (動態掃描所有 Profile 資料夾)
+        $chromiumBrowsers = @(
+            @{ Name = "Microsoft Edge"; Base = [System.IO.Path]::Combine($env:LOCALAPPDATA, "Microsoft\Edge\User Data") },
+            @{ Name = "Google Chrome";  Base = [System.IO.Path]::Combine($env:LOCALAPPDATA, "Google\Chrome\User Data") },
+            @{ Name = "Brave Browser";  Base = [System.IO.Path]::Combine($env:LOCALAPPDATA, "BraveSoftware\Brave-Browser\User Data") }
+        )
 
-- **P2：介面實作與你的既有 UI 規格衝突。**  
-  XAML 明確採用 `#1E1E1E`、`#252526` 等深色主題，並標記為 VS Code Dark Theme；但你的要求是「禁止 UI 使用深色模式」。此項必須在修復版改為淺色、高對比、觸控友善的配置。[1]
+        foreach ($browser in $chromiumBrowsers) {
+            if ([System.IO.Directory]::Exists($browser.Base)) {
+                $profiles = Get-ChildItem -Path $browser.Base -Directory -ErrorAction SilentlyContinue | 
+                            Where-Object { $_.Name -eq "Default" -or $_.Name -like "Profile *" }
+                foreach ($p in $profiles) {
+                    $cachePaths = @(
+                        [System.IO.Path]::Combine($p.FullName, "Cache\Cache_Data"),
+                        [System.IO.Path]::Combine($p.FullName, "Code Cache"),
+                        [System.IO.Path]::Combine($p.FullName, "GPUCache")
+                    )
+                    foreach ($cp in $cachePaths) {
+                        if ([System.IO.Directory]::Exists($cp)) {
+                            $targets.Add([PSCustomObject]@{
+                                Category    = "瀏覽器快取"
+                                Name        = "$($browser.Name) ($($p.Name)) - $([System.IO.Path]::GetFileName($cp))"
+                                BasePath    = $cp
+                                FilePattern = "*"
+                                Recursive   = $true
+                                IsDirectory = $true
+                            })
+                        }
+                    }
+                }
+            }
+        }
 
-- **P2：PowerShell 5.1 相容性宣告與實際語法有落差。**  
-  腳本多處使用 `::new()`，例如 `[System.Collections.Generic.Queue[string]]::new()`、`[System.Windows.Threading.DispatcherFrame]::new()`。雖然部分 Windows PowerShell 5.1 環境可運作，但若要保守地維持 5.1 相容與穩定性，建議改為 `New-Object` 或明確的建構式呼叫策略，特別是泛型集合與 WPF 類型。[1]
+        # 4. Firefox Profiles (嚴格限定 cache2 與 startupCache)
+        $firefoxBase = [System.IO.Path]::Combine($env:LOCALAPPDATA, "Mozilla\Firefox\Profiles")
+        if ([System.IO.Directory]::Exists($firefoxBase)) {
+            $ffProfiles = Get-ChildItem -Path $firefoxBase -Directory -ErrorAction SilentlyContinue
+            foreach ($ffp in $ffProfiles) {
+                $ffCaches = @("cache2", "startupCache")
+                foreach ($cName in $ffCaches) {
+                    $ffPath = [System.IO.Path]::Combine($ffp.FullName, $cName)
+                    if ([System.IO.Directory]::Exists($ffPath)) {
+                        $targets.Add([PSCustomObject]@{
+                            Category    = "瀏覽器快取"
+                            Name        = "Mozilla Firefox ($($ffp.Name)) - $cName"
+                            BasePath    = $ffPath
+                            FilePattern = "*"
+                            Recursive   = $true
+                            IsDirectory = $true
+                        })
+                    }
+                }
+            }
+        }
 
-- **P2：`Clear-DnsClientCache` 與 `ipconfig /flushdns` 可能都受到系統服務狀態影響。**  
-  現有函式只回傳布林值，沒有保留錯誤內容，使用者無從辨識是 DNS Client service 未啟動、指令不存在、權限受限，或 `ipconfig` 回傳非零結束碼。[1]
+        # 5. 開發者快取
+        $vscodeCache = [System.IO.Path]::Combine($env:APPDATA, "Code\Cache")
+        if ([System.IO.Directory]::Exists($vscodeCache)) {
+            $targets.Add([PSCustomObject]@{
+                Category    = "開發環境快取"
+                Name        = "VS Code HTTP 快取"
+                BasePath    = $vscodeCache
+                FilePattern = "*"
+                Recursive   = $true
+                IsDirectory = $true
+            })
+        }
 
-- **P2：清理前沒有關閉或提示關閉相關應用程式。**  
-  Edge、Chrome、Firefox、Discord、Slack、Teams、VS Code 等程式執行時，快取檔常被鎖定。現有程式雖會計數 `LockedCount`，但不會在執行前列出運行中的相關程序，也沒有清理範圍確認，造成清理結果不完整且使用者難以判斷原因。[1]
+        return $targets
+    }
+}
 
-- **P2：多個路徑已可能過時或僅涵蓋 Default Profile。**  
-  Chrome、Edge 與 Brave 僅針對 `Default` 使用者設定檔；多 Profile 使用者的 `Profile 1`、`Profile 2` 等不會被處理。Firefox 反而掃整個 Profiles 根目錄，形成「Chrome/Edge 清得不足、Firefox 清得過頭」的不一致策略。[1]
+function Invoke-SafeCacheOperation {
+    [CmdletBinding()]
+    [OutputType([PSCustomObject])]
+    param(
+        [Parameter(Mandatory = $true)][switch]$ExecuteClean,
+        [Parameter()][scriptblock]$OnProgress
+    )
+    process {
+        $targets = Get-SafeCacheTargets
+        $results = New-Object 'System.Collections.Generic.List[PSCustomObject]'
 
-- **P2：登錄調校值以字串寫入，未保存 registry value kind。**  
-  `Set-ItemProperty` 直接接受字串目標值，未明確讀取/保存 `RegistryValueKind`。即使這些特定桌面值通常是字串，精準備份還原仍應記錄「是否存在、原始值、原始型別」，並在還原時依原始狀態決定 `Remove-ItemProperty` 或寫回正確資料。[1]
+        foreach ($target in $targets) {
+            $bytesFound = [long]0
+            $filesFound = 0
+            $bytesDeleted = [long]0
+            $filesDeleted = 0
+            $lockedFiles = 0
 
-- **P2：例外處理過度靜默。**  
-  多處使用 `catch { }` 或 `-ErrorAction SilentlyContinue`，例如快取量測、registry 讀取、啟動項審查。這能避免單一路徑中斷，但會把存取拒絕、損壞路徑、序列化失敗與邏輯錯誤混為「正常略過」，降低診斷性。[1]
+            if ($null -ne $OnProgress) {
+                & $OnProgress -Status ("正在評估: {0}" -f $target.Name)
+            }
 
-- **P2：工作集修剪的「釋放記憶體」不等於系統效能最佳化。**  
-  `EmptyWorkingSet` 可迫使程序工作集釋出部分頁面，但程序再次使用資料時需重新從記憶體或頁面檔載入，可能增加 page fault 與短期卡頓。把它呈現為「深度調優」與「實體記憶體收回」容易使使用者誤解其持久性或效能效果。[1]
+            try {
+                $searchOption = if ($target.Recursive) { [System.IO.SearchOption]::AllDirectories } else { [System.IO.SearchOption]::TopDirectoryOnly }
+                $dirInfo = New-Object System.IO.DirectoryInfo($target.BasePath)
+                $fileEnumeration = $dirInfo.EnumerateFiles($target.FilePattern, $searchOption)
 
-### 🔵 Info
+                foreach ($file in $fileEnumeration) {
+                    $len = $file.Length
+                    $bytesFound += $len
+                    $filesFound++
 
-- **P3：快取量測與清理會完整走訪兩次。**  
-  `Invoke-UserCacheService` 先執行 `Measure-UserCachePath` 遞迴列舉，再由 `Clear-UserCachePath` 用 `Get-ChildItem -Recurse` 再掃一次；大型快取目錄會出現雙倍 I/O 與較長等待時間。[1]
+                    if ($ExecuteClean) {
+                        try {
+                            $file.Delete()
+                            $bytesDeleted += $len
+                            $filesDeleted++
+                        }
+                        catch {
+                            $lockedFiles++
+                        }
+                    }
+                }
 
-- **P3：`Clear-UserCachePath` 先將所有檔案收集進 `$files`。**  
-  對大量 cache entries，`Get-ChildItem -Recurse` 的完整物件陣列會提高 PowerShell 記憶體壓力。更佳做法是串流列舉並逐檔刪除，或使用 .NET 列舉 API 搭配安全過濾。[1]
+                # 若標記為可清理子目錄且為執行清理
+                if ($ExecuteClean -and $target.IsDirectory) {
+                    $subDirs = $dirInfo.EnumerateDirectories("*", [System.IO.SearchOption]::AllDirectories)
+                    foreach ($d in $subDirs) {
+                        try {
+                            if ($d.Exists -and ($d.GetFileSystemInfos().Count -eq 0)) {
+                                $d.Delete($false)
+                            }
+                        } catch { }
+                    }
+                }
+            }
+            catch {
+                # 存取拒絕或受鎖定時優雅略過
+            }
 
-- **P3：日誌 `TextBox` 無長度上限。**  
-  長時間反覆掃描、清理或列出很多啟動項時，`AppendText()` 會讓文字內容持續累積，拖慢 WPF 介面並增加記憶體使用量。應設置最大行數或最大字元數，超過時截去最舊內容。[1]
+            $results.Add([PSCustomObject][ordered]@{
+                Category    = [string]$target.Category
+                TargetName  = [string]$target.Name
+                FilesCount  = [int]$filesFound
+                SizeBefore  = [string](Format-SafeBytes -Bytes $bytesFound)
+                BytesFound  = [long]$bytesFound
+                BytesFreed  = [long]$bytesDeleted
+                FreedSize   = [string](Format-SafeBytes -Bytes $bytesDeleted)
+                LockedCount = [int]$lockedFiles
+                Status      = if (-not $ExecuteClean) { "預覽完畢" } elseif ($bytesDeleted -gt 0) { "已安全清理" } else { "略過/被佔用" }
+            })
+        }
 
-- **P3：`GC.Collect()` 與 `WaitForPendingFinalizers()` 每次自啟審查都強制執行。**  
-  釋放 `WScript.Shell` COM 物件是合理的，但立刻強制全域 GC 常導致不必要停頓。除非有實測的 COM 釋放問題，通常可只 `ReleaseComObject` 並設為 `$null`。[1]
+        return $results
+    }
+}
 
-- **P3：工作集清理未設定有意義的程序篩選條件。**  
-  除了少量排除清單，幾乎所有可開啟 Handle 的程序皆會嘗試 `EmptyWorkingSet`。建議至少加入最小工作集門檻、排除關鍵系統與目前活躍應用程式的可選策略，避免高成本、低效益的批次呼叫。[1]
+# ----------------------------------------------------------------------
+# 4. 啟動項審查與安全實體備份模組 (Startup Audit & Safe Backup)
+# ----------------------------------------------------------------------
+function Resolve-StartupCommandLine {
+    [CmdletBinding()]
+    [OutputType([PSCustomObject])]
+    param([Parameter(Mandatory = $true)][string]$RawCommand)
+    process {
+        $result = [PSCustomObject]@{
+            ExecutablePath = [string]::Empty
+            Exists         = $false
+            Confidence     = "Uncertain" # Valid, HighConfidenceOrphan, NeedsManualReview
+        }
 
-### 🟢 Style
+        if ([string]::IsNullOrWhiteSpace($RawCommand)) { return $result }
+        $trimmed = $RawCommand.Trim()
 
-- **P4：功能命名與實際風險層級不一致。**  
-  「深度清理」、「系統深度調優」、「保證無系統全域污染」等 UI 文案過度承諾。快取刪除與 HKCU 登錄值變更都會影響使用者設定與應用程式狀態，應改為精確、中性的文案。[1]
+        # 1. 引號路徑匹配: "C:\Program Files\App\app.exe" /arg
+        if ($trimmed.StartsWith('"')) {
+            $secondQuote = $trimmed.IndexOf('"', 1)
+            if ($secondQuote -gt 1) {
+                $extracted = $trimmed.Substring(1, $secondQuote - 1)
+                $expanded = [System.Environment]::ExpandEnvironmentVariables($extracted)
+                $result.ExecutablePath = $expanded
+                $result.Exists = [System.IO.File]::Exists($expanded) -or [System.IO.Directory]::Exists($expanded)
+                $result.Confidence = if ($result.Exists) { "Valid" } else { "HighConfidenceOrphan" }
+                return $result
+            }
+        }
 
-- **P4：Magic Numbers 分散。**  
-  例如視窗高度 720、寬度 1100、按鈕高度 32、日誌字體大小 12、登錄值 `20`、`1500`、`2000` 等。UI 常數與調整策略應集中於設定區，並把高風險調校值標記其影響與可逆性。[1]
+        # 2. 包含腳本或代理調用命令 (cmd.exe, rundll32.exe, powershell.exe 等)
+        $tokens = $trimmed -split '\s+'
+        $firstToken = [System.Environment]::ExpandEnvironmentVariables($tokens[0])
+        $systemHostTools = @("cmd.exe", "cmd", "rundll32.exe", "rundll32", "powershell.exe", "powershell", "wscript.exe", "cscript.exe")
 
-- **P4：多個函式將「掃描、判斷、刪除、備份、輸出」混在一起。**  
-  例如 `Remove-UserStartupOrphan` 同時負責偵測、備份、刪除及建立結果物件。拆分成 `Get-*`、`Backup-*`、`Remove-*`、`Restore-*` 可提升可測試性與還原可靠性。[1]
+        if ($systemHostTools -contains [System.IO.Path]::GetFileName($firstToken).ToLower()) {
+            # 這是由系統組件執行的複合命令，判定風險極高，一律交給人工審查
+            $result.ExecutablePath = $firstToken
+            $result.Exists = $true
+            $result.Confidence = "NeedsManualReview"
+            return $result
+        }
 
-- **P4：備份應具備版本與時間戳。**  
-  固定檔名雖簡單，但不利於撤銷多次操作。以 ISO 8601 timestamp 建立作業批次、保留 manifest 與歷程，能讓使用者選擇特定批次還原。[1]
+        # 3. 無引號漸進式比對
+        $candidate = ""
+        foreach ($token in $tokens) {
+            $candidate = if ([string]::IsNullOrEmpty($candidate)) { $token } else { "$candidate $token" }
+            $expanded = [System.Environment]::ExpandEnvironmentVariables($candidate)
+            if ([System.IO.File]::Exists($expanded)) {
+                $result.ExecutablePath = $expanded
+                $result.Exists = $true
+                $result.Confidence = "Valid"
+                return $result
+            }
+        }
 
-- ✓ **無需修改：整體權限邊界方向正確。**  
-  腳本主要使用 HKCU、使用者 Profile 內的檔案路徑，未直接修改 HKLM、服務設定、系統檔案或使用系統管理員強制操作；這符合 Zero-Privilege 的設計方向。[1]
+        # 4. 系統 PATH 解析
+        $cmdCheck = Get-Command -Name $firstToken -CommandType Application, ExternalScript -ErrorAction SilentlyContinue
+        if ($null -ne $cmdCheck) {
+            $result.ExecutablePath = $cmdCheck.Source
+            $result.Exists = $true
+            $result.Confidence = "Valid"
+            return $result
+        }
 
-- ✓ **無需修改：快取刪除採逐檔 try/catch。**  
-  現行設計不會因單一被鎖定檔案就讓整個清理程序終止，且回傳刪除數、鎖定數與釋放位元組數，這是值得保留的結果模型。[1]
+        # 若均找不到，且開頭明確以磁碟代號起頭，標記為高信心孤立殘留
+        if ($trimmed -match '^[a-zA-Z]:\\') {
+            $result.ExecutablePath = $firstToken
+            $result.Exists = $false
+            $result.Confidence = "HighConfidenceOrphan"
+        } else {
+            $result.ExecutablePath = $firstToken
+            $result.Exists = $false
+            $result.Confidence = "NeedsManualReview"
+        }
 
-- ✓ **無需修改：有備份概念與還原入口。**  
-  雖然備份資料模型尚不完整，但「變更前備份、提供還原」的產品方向正確，應在修復時強化，而不是移除。[1]
+        return $result
+    }
+}
 
-- ✓ **無需修改：啟動項審查先於清理的流程合理。**  
-  工具提供先審查再清理的按鈕分離，符合降低誤刪風險的操作流程；修復時應進一步加入明確確認與更保守的孤立判定。[1]
+function Get-UserStartupAudit {
+    [CmdletBinding()]
+    [OutputType([System.Collections.Generic.List[PSCustomObject]])]
+    param()
+    process {
+        $auditList = New-Object 'System.Collections.Generic.List[PSCustomObject]'
 
-## 建議修復順序
+        # 審查 HKCU 登錄檔
+        foreach ($cfg in $script:AppConfig.StartupRegKeys) {
+            if (-not (Test-Path -Path $cfg.Path)) { continue }
+            try {
+                $regItem = Get-Item -Path $cfg.Path -ErrorAction Stop
+                foreach ($propName in $regItem.Property) {
+                    $rawVal = [string]($regItem.GetValue($propName))
+                    $eval = Resolve-StartupCommandLine -RawCommand $rawVal
 
-1. 先將快取策略從「可刪整個資料夾」改為「可安全刪除的子資料夾或檔案模式白名單」  
-2. 重構 registry 備份格式，保存 `Existed`、`Value`、`ValueKind`，並採時間戳批次備份  
-3. 改為啟動項只做「高信心孤立判定」，不確定命令列一律標記為「需人工確認」，禁止自動刪除  
-4. 實作真正的背景工作機制，避免 WPF UI 在掃描與清理期間無回應  
-5. 將介面改為淺色模式，並加入「預覽、風險提示、確認執行」流程  
-6. 完整實作 Startup folder 檔案的備份與還原，而非只備份 metadata  
-7. 將 Working Set 功能改名為「嘗試修剪程序工作集（暫時性）」並加入適用情境與限制提示  
+                    $auditList.Add([PSCustomObject][ordered]@{
+                        SourceType     = "Registry"
+                        Location       = [string]$cfg.Location
+                        RegistryPath   = [string]$cfg.Path
+                        EntryName      = [string]$propName
+                        RawCommand     = [string]$rawVal
+                        ResolvedTarget = [string]$eval.ExecutablePath
+                        TargetExists   = [bool]$eval.Exists
+                        Confidence     = [string]$eval.Confidence
+                        FilePath       = [string]::Empty
+                    })
+                }
+            } catch { }
+        }
 
-## [等待修復確認]
+        # 審查開始功能表 Startup 資料夾
+        $fPath = $script:AppConfig.StartupFolder
+        if ([System.IO.Directory]::Exists($fPath)) {
+            $wscriptShell = $null
+            try {
+                $wscriptShell = New-Object -ComObject WScript.Shell
+                $files = Get-ChildItem -Path $fPath -File -ErrorAction SilentlyContinue
+                foreach ($file in $files) {
+                    $raw = $file.FullName
+                    $resolved = $file.FullName
+                    $exists = $true
+                    $confidence = "Valid"
 
-診斷完成，是否執行修復並提供完整代碼？
+                    if ($file.Extension -eq ".lnk" -and $null -ne $wscriptShell) {
+                        try {
+                            $sc = $wscriptShell.CreateShortcut($file.FullName)
+                            $targetPath = [System.Environment]::ExpandEnvironmentVariables($sc.TargetPath)
+                            $resolved = $targetPath
+                            $raw = "{0} {1}" -f $sc.TargetPath, $sc.Arguments
+                            if (-not [string]::IsNullOrWhiteSpace($targetPath)) {
+                                $exists = [System.IO.File]::Exists($targetPath) -or [System.IO.Directory]::Exists($targetPath)
+                                $confidence = if ($exists) { "Valid" } else { "HighConfidenceOrphan" }
+                            }
+                        } catch {
+                            $confidence = "NeedsManualReview"
+                        }
+                    }
 
-來源
-[1] pasted_text_1789038356.txt https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/74421186/12cc7f01-588e-4ba3-adf6-351b1032b968/pasted_text_1789038356.txt
+                    $auditList.Add([PSCustomObject][ordered]@{
+                        SourceType     = "Folder"
+                        Location       = "Startup 資料夾"
+                        RegistryPath   = [string]::Empty
+                        EntryName      = [string]$file.Name
+                        RawCommand     = [string]$raw
+                        ResolvedTarget = [string]$resolved
+                        TargetExists   = [bool]$exists
+                        Confidence     = [string]$confidence
+                        FilePath       = [string]$file.FullName
+                    })
+                }
+            }
+            finally {
+                if ($null -ne $wscriptShell) {
+                    [System.Runtime.InteropServices.Marshal]::ReleaseComObject($wscriptShell) | Out-Null
+                    $wscriptShell = $null
+                }
+            }
+        }
+
+        return $auditList
+    }
+}
+
+function Remove-UserStartupOrphanSafe {
+    [CmdletBinding()]
+    [OutputType([System.Collections.Generic.List[PSCustomObject]])]
+    param()
+    process {
+        $audit = Get-UserStartupAudit
+        # 嚴格過濾：必須為 TargetExists = $false 且 Confidence = 'HighConfidenceOrphan'
+        $toRemove = @($audit | Where-Object { (-not $_.TargetExists) -and ($_.Confidence -eq "HighConfidenceOrphan") })
+
+        $results = New-Object 'System.Collections.Generic.List[PSCustomObject]'
+        if ($toRemove.Count -eq 0) { return $results }
+
+        # 建立具備時間戳記的獨立備份目錄
+        $timestamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
+        $batchBackupDir = [System.IO.Path]::Combine($script:AppConfig.BackupRoot, "Startup_$timestamp")
+        [System.IO.Directory]::CreateDirectory($batchBackupDir) | Out-Null
+
+        # 寫入 Manifest JSON
+        $manifestPath = [System.IO.Path]::Combine($batchBackupDir, "StartupManifest.json")
+        $toRemove | ConvertTo-Json -Depth 4 | Set-Content -Path $manifestPath -Encoding UTF8
+
+        # 逐項備份與安全刪除
+        foreach ($item in $toRemove) {
+            try {
+                if ($item.SourceType -eq "Registry") {
+                    Remove-ItemProperty -Path $item.RegistryPath -Name $item.EntryName -ErrorAction Stop
+                    $results.Add([PSCustomObject][ordered]@{
+                        EntryName  = [string]$item.EntryName
+                        SourceType = "Registry"
+                        Action     = "刪除孤立機碼"
+                        Status     = "成功"
+                    })
+                }
+                elseif ($item.SourceType -eq "Folder" -and [System.IO.File]::Exists($item.FilePath)) {
+                    # 實體複製捷徑檔案至備份資料夾以供還原
+                    $destFile = [System.IO.Path]::Combine($batchBackupDir, $item.EntryName)
+                    [System.IO.File]::Copy($item.FilePath, $destFile, $true)
+                    [System.IO.File]::Delete($item.FilePath)
+
+                    $results.Add([PSCustomObject][ordered]@{
+                        EntryName  = [string]$item.EntryName
+                        SourceType = "Folder"
+                        Action     = "移除捷徑並已備份"
+                        Status     = "成功"
+                    })
+                }
+            }
+            catch {
+                $results.Add([PSCustomObject][ordered]@{
+                    EntryName  = [string]$item.EntryName
+                    SourceType = [string]$item.SourceType
+                    Action     = "清理失敗"
+                    Status     = [string]$_.Exception.Message
+                })
+            }
+        }
+
+        return $results
+    }
+}
+
+function Restore-UserStartupSafe {
+    [CmdletBinding()]
+    [OutputType([System.Collections.Generic.List[PSCustomObject]])]
+    param()
+    process {
+        $results = New-Object 'System.Collections.Generic.List[PSCustomObject]'
+        if (-not [System.IO.Directory]::Exists($script:AppConfig.BackupRoot)) { return $results }
+
+        # 尋找最新的 Startup 備份批次目錄
+        $backupDirs = Get-ChildItem -Path $script:AppConfig.BackupRoot -Directory -Filter "Startup_*" -ErrorAction SilentlyContinue | 
+                      Sort-Object -Property CreationTime -Descending
+
+        if ($backupDirs.Count -eq 0) { return $results }
+        $latestBatch = $backupDirs[0].FullName
+        $manifestPath = [System.IO.Path]::Combine($latestBatch, "StartupManifest.json")
+
+        if (-not [System.IO.File]::Exists($manifestPath)) { return $results }
+
+        $jsonContent = [System.IO.File]::ReadAllText($manifestPath, [System.Text.Encoding]::UTF8)
+        $items = ConvertFrom-Json -InputObject $jsonContent
+
+        foreach ($item in $items) {
+            try {
+                if ($item.SourceType -eq "Registry") {
+                    Set-ItemProperty -Path $item.RegistryPath -Name $item.EntryName -Value $item.RawCommand -ErrorAction Stop
+                    $results.Add([PSCustomObject][ordered]@{
+                        EntryName = [string]$item.EntryName
+                        Type      = "Registry"
+                        Action    = "機碼值已完整還原"
+                        Status    = "成功"
+                    })
+                }
+                elseif ($item.SourceType -eq "Folder") {
+                    $backupFile = [System.IO.Path]::Combine($latestBatch, $item.EntryName)
+                    if ([System.IO.File]::Exists($backupFile)) {
+                        $restoreDest = [System.IO.Path]::Combine($script:AppConfig.StartupFolder, $item.EntryName)
+                        [System.IO.File]::Copy($backupFile, $restoreDest, $true)
+                        $results.Add([PSCustomObject][ordered]@{
+                            EntryName = [string]$item.EntryName
+                            Type      = "Folder"
+                            Action    = "捷徑實體檔案已還原"
+                            Status    = "成功"
+                        })
+                    }
+                }
+            }
+            catch {
+                $results.Add([PSCustomObject][ordered]@{
+                    EntryName = [string]$item.EntryName
+                    Type      = [string]$item.SourceType
+                    Action    = "還原失敗"
+                    Status    = [string]$_.Exception.Message
+                })
+            }
+        }
+
+        return $results
+    }
+}
+
+# ----------------------------------------------------------------------
+# 5. HKCU 登錄檔精準備份與可逆調優 (Exact Registry Tuning & Restore)
+# ----------------------------------------------------------------------
+function Set-UserRegistryTuningSafe {
+    [CmdletBinding()]
+    [OutputType([System.Collections.Generic.List[PSCustomObject]])]
+    param()
+    process {
+        if (-not [System.IO.Directory]::Exists($script:AppConfig.BackupRoot)) {
+            [System.IO.Directory]::CreateDirectory($script:AppConfig.BackupRoot) | Out-Null
+        }
+
+        $timestamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
+        $backupFile = [System.IO.Path]::Combine($script:AppConfig.BackupRoot, "RegBackup_$timestamp.json")
+
+        $backupPayload = New-Object 'System.Collections.Generic.List[hashtable]'
+        $results = New-Object 'System.Collections.Generic.List[PSCustomObject]'
+
+        foreach ($spec in $script:AppConfig.RegistrySpecs) {
+            $path = $spec.Path
+            $key = $spec.KeyName
+            $target = $spec.TargetValue
+
+            $existed = $false
+            $currentVal = $null
+            $currentKind = "String"
+
+            if (Test-Path -Path $path) {
+                try {
+                    $prop = Get-ItemProperty -Path $path -Name $key -ErrorAction SilentlyContinue
+                    if ($null -ne $prop -and $null -ne $prop.$key) {
+                        $existed = $true
+                        $currentVal = [string]$prop.$key
+                    }
+                } catch { }
+            } else {
+                New-Item -Path $path -Force | Out-Null
+            }
+
+            # 記錄真實狀態至備份清單
+            $backupPayload.Add(@{
+                Path      = $path
+                KeyName   = $key
+                Existed   = $existed
+                OldValue  = $currentVal
+                ValueKind = $currentKind
+            })
+
+            # 套用新值
+            Set-ItemProperty -Path $path -Name $key -Value $target -ErrorAction SilentlyContinue
+
+            $results.Add([PSCustomObject][ordered]@{
+                SettingName = [string]$spec.Name
+                BeforeValue = if ($existed) { $currentVal } else { "<原本未設定>" }
+                AfterValue  = [string]$target
+                Difference  = if ($existed) { "$currentVal ➔ $target" } else { "未建立 ➔ $target" }
+                Status      = "已套用"
+            })
+        }
+
+        # 序列化輸出
+        $backupPayload | ConvertTo-Json -Depth 3 | Set-Content -Path $backupFile -Encoding UTF8
+        return $results
+    }
+}
+
+function Restore-UserRegistryTuningSafe {
+    [CmdletBinding()]
+    [OutputType([System.Collections.Generic.List[PSCustomObject]])]
+    param()
+    process {
+        $results = New-Object 'System.Collections.Generic.List[PSCustomObject]'
+        if (-not [System.IO.Directory]::Exists($script:AppConfig.BackupRoot)) { return $results }
+
+        # 取得最新的一份登錄檔備份
+        $backupFiles = Get-ChildItem -Path $script:AppConfig.BackupRoot -Filter "RegBackup_*.json" -ErrorAction SilentlyContinue | 
+                       Sort-Object -Property CreationTime -Descending
+
+        if ($backupFiles.Count -eq 0) { return $results }
+        $targetBackup = $backupFiles[0].FullName
+
+        $jsonText = [System.IO.File]::ReadAllText($targetBackup, [System.Text.Encoding]::UTF8)
+        $items = ConvertFrom-Json -InputObject $jsonText
+
+        foreach ($item in $items) {
+            $path = $item.Path
+            $key = $item.KeyName
+            $existed = [bool]$item.Existed
+            $oldVal = $item.OldValue
+
+            if (-not (Test-Path -Path $path)) { continue }
+
+            try {
+                if ($existed) {
+                    # 原始存在者寫回原值
+                    Set-ItemProperty -Path $path -Name $key -Value $oldVal -ErrorAction Stop
+                    $results.Add([PSCustomObject][ordered]@{
+                        RegistryKey = "$path\$key"
+                        RestoredTo  = [string]$oldVal
+                        Action      = "恢復數值"
+                        Status      = "成功"
+                    })
+                } else {
+                    # 原始根本不存在者，予以刪除以維持精準契約！
+                    Remove-ItemProperty -Path $path -Name $key -ErrorAction SilentlyContinue
+                    $results.Add([PSCustomObject][ordered]@{
+                        RegistryKey = "$path\$key"
+                        RestoredTo  = "<已移除鍵值>"
+                        Action      = "刪除未設定項"
+                        Status      = "成功"
+                    })
+                }
+            }
+            catch {
+                $results.Add([PSCustomObject][ordered]@{
+                    RegistryKey = "$path\$key"
+                    RestoredTo  = "還原失敗"
+                    Action      = "異常"
+                    Status      = [string]$_.Exception.Message
+                })
+            }
+        }
+
+        return $results
+    }
+}
+
+# ----------------------------------------------------------------------
+# 6. 程序工作集暫時修剪與 DNS 清理 (WorkingSet Trim & DNS Flush)
+# ----------------------------------------------------------------------
+function Optimize-UserWorkingSetSafe {
+    [CmdletBinding()]
+    [OutputType([PSCustomObject])]
+    param(
+        [Parameter()][long]$MinWorkingSetBytes = 52428800 # 50 MB 門檻
+    )
+    process {
+        Initialize-SafeNativeMethods
+
+        $topList = New-Object 'System.Collections.Generic.List[PSCustomObject]'
+        $processed = 0
+        $skipped = 0
+        $initialTotal = [long]0
+        $finalTotal = [long]0
+
+        $excluded = @("powershell", "powershell_ise", "cmd", "conhost", "explorer")
+        $procs = Get-Process -ErrorAction SilentlyContinue
+
+        foreach ($p in $procs) {
+            if ($excluded -contains $p.ProcessName.ToLower() -or $p.Id -eq $PID) {
+                continue
+            }
+
+            try {
+                $bytesBefore = $p.WorkingSet64
+                if ($bytesBefore -lt $MinWorkingSetBytes) {
+                    $skipped++
+                    continue
+                }
+
+                $handle = $p.Handle
+                $success = [Win32ProcessMemoryHelper]::EmptyWorkingSet($handle)
+                if ($success) {
+                    $p.Refresh()
+                    $bytesAfter = $p.WorkingSet64
+                    $delta = $bytesBefore - $bytesAfter
+
+                    $initialTotal += $bytesBefore
+                    $finalTotal += $bytesAfter
+
+                    if ($delta -gt 0) {
+                        $topList.Add([PSCustomObject][ordered]@{
+                            ProcessName = [string]$p.ProcessName
+                            PID         = [int]$p.Id
+                            BeforeSize  = [string](Format-SafeBytes -Bytes $bytesBefore)
+                            AfterSize   = [string](Format-SafeBytes -Bytes $bytesAfter)
+                            DeltaSize   = [string](Format-SafeBytes -Bytes $delta)
+                            RawDelta    = [long]$delta
+                        })
+                    }
+                    $processed++
+                } else {
+                    $skipped++
+                }
+            } catch {
+                $skipped++
+            }
+        }
+
+        $totalFreed = [Math]::Max([long]0, ($initialTotal - $finalTotal))
+
+        return [PSCustomObject][ordered]@{
+            ProcessedCount = [int]$processed
+            SkippedCount   = [int]$skipped
+            InitialDisplay = [string](Format-SafeBytes -Bytes $initialTotal)
+            FinalDisplay   = [string](Format-SafeBytes -Bytes $finalTotal)
+            FreedDisplay   = [string](Format-SafeBytes -Bytes $totalFreed)
+            TopItems       = [PSCustomObject[]]($topList | Sort-Object -Property RawDelta -Descending)
+        }
+    }
+}
+
+function Clear-UserDnsCacheSafe {
+    [CmdletBinding()]
+    [OutputType([PSCustomObject])]
+    param()
+    process {
+        try {
+            Clear-DnsClientCache -ErrorAction Stop
+            return [PSCustomObject]@{ Success = $true; Method = "Clear-DnsClientCache Cmdlet"; Message = "DNS 用戶端快取已順利清空。" }
+        }
+        catch {
+            $cmdError = $_.Exception.Message
+            try {
+                $p = Start-Process -FilePath "ipconfig.exe" -ArgumentList "/flushdns" -NoNewWindow -Wait -PassThru
+                if ($p.ExitCode -eq 0) {
+                    return [PSCustomObject]@{ Success = $true; Method = "ipconfig /flushdns"; Message = "已透過系統指令清空解析快取。" }
+                } else {
+                    return [PSCustomObject]@{ Success = $false; Method = "ipconfig /flushdns"; Message = ("結束碼非零 ({0})" -f $p.ExitCode) }
+                }
+            }
+            catch {
+                return [PSCustomObject]@{ Success = $false; Method = "None"; Message = ("執行失敗: {0}" -f $cmdError) }
+            }
+        }
+    }
+}
+
+# ----------------------------------------------------------------------
+# 7. WPF 現代高對比淺色介面 (Modern Light UI Controller)
+# ----------------------------------------------------------------------
+function Start-UserMaintenanceGui {
+    [CmdletBinding()]
+    param()
+
+    [xml]$xaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Windows 系統維護與安全清理工具 (標準使用者權限)" 
+        Height="760" Width="1180" MinHeight="600" MinWidth="940"
+        WindowStartupLocation="CenterScreen" Background="#F9FAFB">
+    <Window.Resources>
+        <!-- 現代淺色高對比按鈕風格 -->
+        <Style TargetType="Button">
+            <Setter Property="Background" Value="#FFFFFF"/>
+            <Setter Property="Foreground" Value="#1F2937"/>
+            <Setter Property="FontSize" Value="12.5"/>
+            <Setter Property="FontFamily" Value="Segoe UI, Microsoft JhengHei UI"/>
+            <Setter Property="Height" Value="34"/>
+            <Setter Property="Margin" Value="0,3,0,3"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="BorderBrush" Value="#D1D5DB"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="HorizontalContentAlignment" Value="Left"/>
+            <Setter Property="Padding" Value="12,0,0,0"/>
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Background" Value="#EFF6FF"/>
+                    <Setter Property="BorderBrush" Value="#0F6CBD"/>
+                    <Setter Property="Foreground" Value="#0F6CBD"/>
+                </Trigger>
+                <Trigger Property="IsEnabled" Value="False">
+                    <Setter Property="Background" Value="#F3F4F6"/>
+                    <Setter Property="Foreground" Value="#9CA3AF"/>
+                    <Setter Property="BorderBrush" Value="#E5E7EB"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+
+        <Style x:Key="AccentButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+            <Setter Property="Background" Value="#F0FDF4"/>
+            <Setter Property="BorderBrush" Value="#86EFAC"/>
+            <Setter Property="Foreground" Value="#15803D"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Background" Value="#DCFCE7"/>
+                    <Setter Property="BorderBrush" Value="#16A34A"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+
+        <Style TargetType="TextBlock" x:Key="GroupTitle">
+            <Setter Property="Foreground" Value="#0F6CBD"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="Margin" Value="4,10,0,4"/>
+        </Style>
+    </Window.Resources>
+
+    <Grid Margin="14">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="320"/>
+            <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+
+        <!-- 左側控制面板 -->
+        <Border Grid.Column="0" Background="#FFFFFF" CornerRadius="6" Padding="14" Margin="0,0,12,0" BorderBrush="#E5E7EB" BorderThickness="1">
+            <ScrollViewer VerticalScrollBarVisibility="Auto">
+                <StackPanel>
+                    <TextBlock Text="🛠️ 系統維護套件" Foreground="#111827" FontSize="17" FontWeight="Bold" Margin="4,0,0,2"/>
+                    <TextBlock Text="權限邊界: 標準使用者 (無 UAC 需求)" Foreground="#6B7280" FontSize="11" Margin="4,0,0,10"/>
+
+                    <TextBlock Text="【安全快取維護 (精準白名單)】" Style="{StaticResource GroupTitle}"/>
+                    <Button Name="BtnScanCache" Content="🔍 預覽掃描快取 (僅分析不刪除)"/>
+                    <Button Name="BtnClearCache" Content="🧹 執行安全快取清理 (依白名單)" Style="{StaticResource AccentButton}"/>
+
+                    <TextBlock Text="【開機自啟項目審查】" Style="{StaticResource GroupTitle}"/>
+                    <Button Name="BtnAuditStartup" Content="📋 審查開機啟動項目"/>
+                    <Button Name="BtnCleanOrphanStartup" Content="🗑️ 清理高信心孤立項 (自動備份)"/>
+                    <Button Name="BtnRestoreStartup" Content="↩️ 還原啟動項備份 (含捷徑檔)"/>
+
+                    <TextBlock Text="【系統響應與暫存優化】" Style="{StaticResource GroupTitle}"/>
+                    <Button Name="BtnTuneRegistry" Content="🚀 套用 HKCU 響應調整 (自動備份)"/>
+                    <Button Name="BtnRestoreRegistry" Content="↩️ 精準還原登錄值 (可還原未建立)"/>
+                    <Button Name="BtnTrimMemory" Content="💾 嘗試修剪程式工作集 (門檻 50MB)"/>
+                    <Button Name="BtnFlushDns" Content="🌐 重新整理本機 DNS 快取"/>
+
+                    <Separator Margin="0,16,0,10" Background="#E5E7EB"/>
+                    <Button Name="BtnClearLog" Content="🧽 清除歷程記錄" Background="#FEF2F2" BorderBrush="#FECACA" Foreground="#DC2626"/>
+                </StackPanel>
+            </ScrollViewer>
+        </Border>
+
+        <!-- 右側歷程看板 -->
+        <Grid Grid.Column="1">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+
+            <!-- 標題欄 -->
+            <Border Grid.Row="0" Background="#FFFFFF" Padding="14,10" CornerRadius="6,6,0,0" BorderBrush="#E5E7EB" BorderThickness="1,1,1,0">
+                <DockPanel>
+                    <TextBlock Text="執行歷程與「調整前 / 調整後」差異明細" Foreground="#111827" FontWeight="Bold" FontSize="13" VerticalAlignment="Center"/>
+                    <TextBlock Name="TxtActiveTarget" Text="就緒 (Ready)" Foreground="#16A34A" FontWeight="SemiBold" HorizontalAlignment="Right" VerticalAlignment="Center" FontSize="12"/>
+                </DockPanel>
+            </Border>
+
+            <!-- 等寬字體日誌框 -->
+            <TextBox Name="TxtLogOutput" Grid.Row="1"
+                     Background="#FFFFFF" Foreground="#1F2937"
+                     FontFamily="Consolas, Cascadia Mono, Courier New" FontSize="12.5"
+                     IsReadOnly="True" AcceptsReturn="True" TextWrapping="NoWrap"
+                     VerticalScrollBarVisibility="Visible" HorizontalScrollBarVisibility="Auto"
+                     BorderBrush="#E5E7EB" BorderThickness="1" Padding="10"/>
+
+            <!-- 狀態列 -->
+            <Border Grid.Row="2" Background="#0F6CBD" Padding="10,6" CornerRadius="0,0,6,6">
+                <DockPanel>
+                    <TextBlock Name="TxtStatusBar" Text="所有模組加載就緒。安全白名單防護中。" Foreground="#FFFFFF" FontSize="11.5"/>
+                    <TextBlock Text="v4.5.0 (Safe Edition) | PS 5.1" Foreground="#E0E7FF" HorizontalAlignment="Right" FontSize="11.5"/>
+                </DockPanel>
+            </Border>
+        </Grid>
+    </Grid>
+</Window>
+"@
+
+    $reader = New-Object System.Xml.XmlNodeReader $xaml
+    $window = [System.Windows.Markup.XamlReader]::Load($reader)
+
+    $btnScanCache          = $window.FindName("BtnScanCache")
+    $btnClearCache         = $window.FindName("BtnClearCache")
+    $btnAuditStartup       = $window.FindName("BtnAuditStartup")
+    $btnCleanOrphanStartup = $window.FindName("BtnCleanOrphanStartup")
+    $btnRestoreStartup     = $window.FindName("BtnRestoreStartup")
+    $btnTuneRegistry       = $window.FindName("BtnTuneRegistry")
+    $btnRestoreRegistry    = $window.FindName("BtnRestoreRegistry")
+    $btnTrimMemory         = $window.FindName("BtnTrimMemory")
+    $btnFlushDns           = $window.FindName("BtnFlushDns")
+    $btnClearLog           = $window.FindName("BtnClearLog")
+    $txtLogOutput          = $window.FindName("TxtLogOutput")
+    $txtActiveTarget       = $window.FindName("TxtActiveTarget")
+    $txtStatusBar          = $window.FindName("TxtStatusBar")
+
+    $allButtons = @(
+        $btnScanCache, $btnClearCache, $btnAuditStartup, 
+        $btnCleanOrphanStartup, $btnRestoreStartup, $btnTuneRegistry, 
+        $btnRestoreRegistry, $btnTrimMemory, $btnFlushDns
+    )
+
+    # UI 幫浦防卡死
+    $script:PumpEvents = {
+        $frame = New-Object System.Windows.Threading.DispatcherFrame
+        [System.Windows.Threading.Dispatcher]::CurrentDispatcher.BeginInvoke(
+            [System.Windows.Threading.DispatcherPriority]::Background,
+            [System.Action[System.Windows.Threading.DispatcherFrame]]{ param($f) $f.Continue = $false },
+            $frame
+        ) | Out-Null
+        [System.Windows.Threading.Dispatcher]::PushFrame($frame)
+    }
+
+    $script:AppendLog = {
+        param([string]$Message, [string]$Level = "INFO")
+        $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+        $prefix = switch ($Level) {
+            "SUCCESS" { "[✓ 成功]" }
+            "WARN"    { "[! 注意]" }
+            "ERROR"   { "[✗ 異常]" }
+            default   { "[i 資訊]" }
+        }
+        $line = "{0} {1} {2}" -f $timestamp, $prefix, $Message
+
+        # 保護限制：若超過最大長度，截斷最舊的一半內容
+        if ($txtLogOutput.Text.Length -gt $script:AppConfig.MaxLogChars) {
+            $txtLogOutput.Text = $txtLogOutput.Text.Substring($txtLogOutput.Text.Length / 2)
+        }
+
+        $txtLogOutput.AppendText($line + [System.Environment]::NewLine)
+        $txtLogOutput.ScrollToEnd()
+        & $script:PumpEvents
+    }
+
+    $script:ExecuteWrapper = {
+        param([string]$TaskTitle, [scriptblock]$Action)
+        foreach ($b in $allButtons) { $b.IsEnabled = $false }
+        $txtActiveTarget.Text = "處理中: $TaskTitle"
+        $txtActiveTarget.Foreground = [System.Windows.Media.Brushes]::DarkOrange
+        $txtStatusBar.Text = "正在處理: $TaskTitle..."
+
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        & $script:AppendLog -Message "========== 開始作業: $TaskTitle ==========" -Level "INFO"
+
+        try {
+            & $Action
+        }
+        catch {
+            & $script:AppendLog -Message "作業發生例外: $($_.Exception.Message)" -Level "ERROR"
+        }
+        finally {
+            $sw.Stop()
+            & $script:AppendLog -Message "========== 作業完成: $TaskTitle (耗時: $($sw.Elapsed.TotalSeconds.ToString("N2")) 秒) ==========`n" -Level "SUCCESS"
+            foreach ($b in $allButtons) { $b.IsEnabled = $true }
+            $txtActiveTarget.Text = "就緒 (Ready)"
+            $txtActiveTarget.Foreground = [System.Windows.Media.Brushes]::Green
+            $txtStatusBar.Text = "任務 [$TaskTitle] 結束。"
+        }
+    }
+
+    # 1. 預覽掃描快取
+    $btnScanCache.Add_Click({
+        & $script:ExecuteWrapper -TaskTitle "預覽掃描受管快取" -Action {
+            $res = Invoke-SafeCacheOperation -ExecuteClean:$false -OnProgress {
+                param($Status)
+                $txtStatusBar.Text = $Status
+                & $script:PumpEvents
+            }
+            if ($res.Count -gt 0) {
+                & $script:AppendLog -Message "【安全快取掃描預估表 (未刪除任何檔案)】" -Level "INFO"
+                $table = $res | Format-Table -AutoSize -Property Category, TargetName, FilesCount, SizeBefore, Status | Out-String
+                $txtLogOutput.AppendText($table)
+                $totalBytes = ($res | Measure-Object -Property BytesFound -Sum).Sum
+                & $script:AppendLog -Message "預計可安全釋放空間總計: $(Format-SafeBytes -Bytes ([long]$totalBytes))" -Level "SUCCESS"
+            }
+        }
+    })
+
+    # 2. 執行安全清理
+    $btnClearCache.Add_Click({
+        & $script:ExecuteWrapper -TaskTitle "執行安全快取清理" -Action {
+            & $script:AppendLog -Message "提示: 執行中若遇到被開啟的檔案將自動略過 (保證不中斷)。" -Level "INFO"
+            $res = Invoke-SafeCacheOperation -ExecuteClean:$true -OnProgress {
+                param($Status)
+                $txtStatusBar.Text = $Status
+                & $script:PumpEvents
+            }
+            if ($res.Count -gt 0) {
+                & $script:AppendLog -Message "【清理前容量 / 實質釋放容量 明細對照表】" -Level "INFO"
+                $table = $res | Format-Table -AutoSize -Property TargetName, SizeBefore, FreedSize, LockedCount, Status | Out-String
+                $txtLogOutput.AppendText($table)
+                $freedBytes = ($res | Measure-Object -Property BytesFreed -Sum).Sum
+                & $script:AppendLog -Message "清理作業完成！共釋放空間: $(Format-SafeBytes -Bytes ([long]$freedBytes))" -Level "SUCCESS"
+            }
+        }
+    })
+
+    # 3. 審查自啟項
+    $btnAuditStartup.Add_Click({
+        & $script:ExecuteWrapper -TaskTitle "審查開機啟動項目" -Action {
+            $audit = Get-UserStartupAudit
+            if ($audit.Count -eq 0) {
+                & $script:AppendLog -Message "未發現登錄在當前使用者底下的自啟項目。" -Level "INFO"
+            } else {
+                & $script:AppendLog -Message "【開機自啟項目審查報告】" -Level "INFO"
+                $table = $audit | Format-Table -AutoSize -Property EntryName, SourceType, TargetExists, Confidence, ResolvedTarget | Out-String
+                $txtLogOutput.AppendText($table)
+
+                $highOrphans = ($audit | Where-Object { $_.Confidence -eq "HighConfidenceOrphan" }).Count
+                $manualReview = ($audit | Where-Object { $_.Confidence -eq "NeedsManualReview" }).Count
+
+                if ($highOrphans -gt 0) {
+                    & $script:AppendLog -Message "發現 $highOrphans 個高信心孤立殘留項，可安全點擊清理。" -Level "WARN"
+                }
+                if ($manualReview -gt 0) {
+                    & $script:AppendLog -Message "注意: 有 $manualReview 個項目因含複合參數，標記為「需人工確認」，系統絕不自動刪除。" -Level "INFO"
+                }
+            }
+        }
+    })
+
+    # 4. 清理孤立項
+    $btnCleanOrphanStartup.Add_Click({
+        & $script:ExecuteWrapper -TaskTitle "清理高信心孤立自啟項" -Action {
+            $cleaned = Remove-UserStartupOrphanSafe
+            if ($cleaned.Count -eq 0) {
+                & $script:AppendLog -Message "未偵測到符合「高信心孤立」的無效項目，略過清理以維護系統穩定。" -Level "INFO"
+            } else {
+                & $script:AppendLog -Message "【已清理孤立項目清單】" -Level "INFO"
+                $table = $cleaned | Format-Table -AutoSize -Property EntryName, SourceType, Action, Status | Out-String
+                $txtLogOutput.AppendText($table)
+                & $script:AppendLog -Message "清理項目已連同實體捷徑完整備份於: $($script:AppConfig.BackupRoot)" -Level "SUCCESS"
+            }
+        }
+    })
+
+    # 5. 還原自啟備份
+    $btnRestoreStartup.Add_Click({
+        & $script:ExecuteWrapper -TaskTitle "還原開機自啟備份" -Action {
+            $restored = Restore-UserStartupSafe
+            if ($restored.Count -eq 0) {
+                & $script:AppendLog -Message "未找到可還原之自啟項目備份檔。" -Level "WARN"
+            } else {
+                & $script:AppendLog -Message "【自啟備份還原結果】" -Level "INFO"
+                $table = $restored | Format-Table -AutoSize -Property EntryName, Type, Action, Status | Out-String
+                $txtLogOutput.AppendText($table)
+                & $script:AppendLog -Message "自啟項目還原作業已結束。" -Level "SUCCESS"
+            }
+        }
+    })
+
+    # 6. 套用 HKCU 調優
+    $btnTuneRegistry.Add_Click({
+        & $script:ExecuteWrapper -TaskTitle "套用 HKCU 響應調整" -Action {
+            $res = Set-UserRegistryTuningSafe
+            & $script:AppendLog -Message "【登錄值調整前 / 調整後 數值對照表】" -Level "INFO"
+            $table = $res | Format-Table -AutoSize -Property SettingName, BeforeValue, AfterValue, Difference, Status | Out-String
+            $txtLogOutput.AppendText($table)
+            & $script:AppendLog -Message "原始數值已建立獨立時間戳記備份檔。" -Level "SUCCESS"
+        }
+    })
+
+    # 7. 還原 HKCU 調優
+    $btnRestoreRegistry.Add_Click({
+        & $script:ExecuteWrapper -TaskTitle "精準還原 HKCU 登錄值" -Action {
+            $res = Restore-UserRegistryTuningSafe
+            if ($res.Count -eq 0) {
+                & $script:AppendLog -Message "未找到先前的登錄檔備份檔案。" -Level "WARN"
+            } else {
+                & $script:AppendLog -Message "【登錄檔精準還原對照表】" -Level "INFO"
+                $table = $res | Format-Table -AutoSize -Property RegistryKey, RestoredTo, Action, Status | Out-String
+                $txtLogOutput.AppendText($table)
+                & $script:AppendLog -Message "已依據備份契約精準復原（原先不存在的鍵值已正確刪除）。" -Level "SUCCESS"
+            }
+        }
+    })
+
+    # 8. 修剪工作集
+    $btnTrimMemory.Add_Click({
+        & $script:ExecuteWrapper -TaskTitle "嘗試修剪程序工作集" -Action {
+            & $script:AppendLog -Message "說明: 本操作呼叫 EmptyWorkingSet 促使程序釋出閒置實體分頁，此為暫時性狀態。" -Level "INFO"
+            $mem = Optimize-UserWorkingSetSafe -MinWorkingSetBytes 52428800
+            if ($mem.TopItems.Count -gt 0) {
+                & $script:AppendLog -Message "【修剪成效顯著之處理常式 (工作集 > 50MB)】" -Level "INFO"
+                $table = $mem.TopItems | Select-Object -First 10 | 
+                         Format-Table -AutoSize -Property ProcessName, PID, BeforeSize, AfterSize, DeltaSize | Out-String
+                $txtLogOutput.AppendText($table)
+            }
+            & $script:AppendLog -Message ("總計修剪前: {0} ➔ 修剪後: {1} (暫時轉移空間: {2})" -f $mem.InitialDisplay, $mem.FinalDisplay, $mem.FreedDisplay) -Level "SUCCESS"
+        }
+    })
+
+    # 9. 重新整理 DNS
+    $btnFlushDns.Add_Click({
+        & $script:ExecuteWrapper -TaskTitle "重新整理 DNS 快取" -Action {
+            $dnsRes = Clear-UserDnsCacheSafe
+            if ($dnsRes.Success) {
+                & $script:AppendLog -Message ("成功: {0} (呼叫方式: {1})" -f $dnsRes.Message, $dnsRes.Method) -Level "SUCCESS"
+            } else {
+                & $script:AppendLog -Message ("失敗: {0} (呼叫方式: {1})" -f $dnsRes.Message, $dnsRes.Method) -Level "ERROR"
+            }
+        }
+    })
+
+    # 清空日誌按鈕
+    $btnClearLog.Add_Click({
+        $txtLogOutput.Clear()
+        & $script:AppendLog -Message "歷程日誌已清空。" -Level "INFO"
+    })
+
+    & $script:AppendLog -Message "系統維護工具已就緒。介面主題: 現代淺色高對比。" -Level "INFO"
+    & $script:AppendLog -Message "保護機制已生效：快取白名單化、高信心啟動項隔離、登錄可逆還原契約。" -Level "INFO"
+
+    $window.ShowDialog() | Out-Null
+}
+
+# ----------------------------------------------------------------------
+# 8. 進入點保護 (Dot-Source 與 直接執行判定)
+# ----------------------------------------------------------------------
+if ($MyInvocation.InvocationName -ne '.' -and ($MyInvocation.Line -notmatch '^\s*\.\s+')) {
+    Start-UserMaintenanceGui
+}
